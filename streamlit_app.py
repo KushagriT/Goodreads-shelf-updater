@@ -210,18 +210,33 @@ def process_books(df, email, progress_bar, status_text):
     for idx, row in df.iterrows():
         title = str(row.get("Title", "")).strip()
         author = str(row.get("Author", "")).strip()
-        existing = str(row.get("Bookshelves", ""))
+        existing_raw = str(row.get("Bookshelves", ""))
 
         status_text.markdown(f"**Processing:** {title} — *{author}*")
         progress_bar.progress((idx + 1) / total)
 
-        shelves = set()
+        # Parse existing shelves (comma or space separated)
+        existing_tags = set()
+        if existing_raw and existing_raw.lower() != "nan":
+            if "," in existing_raw:
+                parts = [p.strip() for p in existing_raw.split(",") if p.strip()]
+            else:
+                parts = [p.strip() for p in re.split(r"\s+", existing_raw.strip()) if p.strip()]
+            for s in parts:
+                s_clean = re.sub(r"\s*\(.*\)\s*$", "", s).strip()
+                if s_clean:
+                    existing_tags.add(s_clean)
 
-        if existing and existing.lower() != "nan":
-            for s in existing.split(","):
-                s = s.strip()
-                if s:
-                    shelves.add(s)
+        def _is_status_tag(t):
+            tn = re.sub(r"\s*\(.*\)\s*$", "", str(t).strip().lower())
+            tn = re.sub(r"\s+", "-", tn)
+            statuses = {"to-read", "currently-reading", "read", "reading", "want-to-read"}
+            for st in statuses:
+                if tn == st or tn.startswith(st):
+                    return True
+            return False
+
+        filtered = {t for t in existing_tags if not _is_status_tag(t)}
 
         # Prefer ISBN when available for more accurate matches
         isbn = None
@@ -234,20 +249,37 @@ def process_books(df, email, progress_bar, status_text):
                     break
 
         # Book-level genre lookup removed; only nationality shelves applied.
-
         qids = get_wikidata_nationality(author, email)
-        shelves.update(nationality_shelves(qids))
+        merged = set(filtered)
+        merged.update(nationality_shelves(qids))
 
         shelves = {
             re.sub(r"\s+", "-", s.strip().lower())
-            for s in shelves if s and s.lower() != "nan"
+            for s in merged if s and s.lower() != "nan"
         }
 
-        new_shelves.append(", ".join(sorted(shelves)))
+        # space-separated Bookshelves (excluding status shelves)
+        new_shelves.append(" ".join(sorted(shelves)))
         time.sleep(0.4)
 
     df = df.copy()
     df["Bookshelves"] = new_shelves
+    # Mirror Exclusive Shelf into Shelves column
+    if "Exclusive Shelf" in df.columns:
+        df["Shelves"] = df["Exclusive Shelf"]
+    else:
+        df["Shelves"] = ""
+
+    # Reorder columns: core set first, then preserve any other original columns
+    core_cols = [
+        "Title", "Author", "ISBN", "My Rating", "Average Rating", "Publisher",
+        "Binding", "Year Published", "Original Publication Year", "Date Read",
+        "Date Added", "Shelves", "Bookshelves", "My Review"
+    ]
+    orig_cols = list(df.columns)
+    other_cols = [c for c in orig_cols if c not in core_cols]
+    final_cols = [c for c in core_cols if c in df.columns] + other_cols
+    df = df.reindex(columns=final_cols)
     return df
 
 
@@ -314,7 +346,7 @@ if uploaded_file:
             progress_bar.progress(1.0)
 
             # Stats
-            all_shelves = [s for row in result_df["Bookshelves"] for s in row.split(", ") if s]
+            all_shelves = [s for row in result_df["Bookshelves"] for s in (str(row).split() if str(row).strip() else [])]
             unique_shelves = set(all_shelves)
             avg_per_book = round(len(all_shelves) / book_count, 1)
 

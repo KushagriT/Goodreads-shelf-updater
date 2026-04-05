@@ -171,7 +171,7 @@ def _search_wikidata_author(author_name):
     """
     # Wikidata policy: identify your client or requests are silently dropped.
     headers = {
-        "User-Agent": "GoodreadsShelfUpdater/1.0 (youremail@gmail.com)"
+        "User-Agent": "GoodreadsShelfUpdater/1.0 (youremail@example.com)"
     }
 
     try:
@@ -494,55 +494,86 @@ def process_books(df):
     for idx, row in df.iterrows():
         title = str(row.get("Title", "")).strip()
         author = str(row.get("Author", "")).strip()
-        existing = str(row.get("Bookshelves", ""))
+        existing_raw = str(row.get("Bookshelves", ""))
 
         print(f"\n[{idx+1}/{len(df)}] {title} — {author}")
 
-        shelves = set()
+        # Parse existing shelves (supports comma-separated or space-separated)
+        existing_tags = set()
+        if existing_raw and existing_raw.lower() != "nan":
+            if "," in existing_raw:
+                parts = [p.strip() for p in existing_raw.split(",") if p.strip()]
+            else:
+                parts = [p.strip() for p in re.split(r"\s+", existing_raw.strip()) if p.strip()]
+            for s in parts:
+                # remove position suffixes like "(#123)" and trim
+                s_clean = re.sub(r"\s*\(.*\)\s*$", "", s).strip()
+                if s_clean:
+                    existing_tags.add(s_clean)
 
-        # 1. Keep existing shelves
-        if existing and existing.lower() != "nan":
-            for s in existing.split(","):
-                s = s.strip()
-                if s:
-                    shelves.add(s)
+        # Status shelves we want to exclude from Bookshelves
+        def _is_status_tag(t):
+            tn = re.sub(r"\s*\(.*\)\s*$", "", str(t).strip().lower())
+            tn = re.sub(r"\s+", "-", tn)
+            statuses = {"to-read", "currently-reading", "read"}
+            for st in statuses:
+                if tn == st or tn.startswith(st):
+                    return True
+            return False
+
+        filtered = {t for t in existing_tags if not _is_status_tag(t)}
 
         # Prefer ISBN-based lookups when possible (use ISBN13 then ISBN)
         isbn = None
         for col in ("ISBN13", "ISBN"):
             raw = str(row.get(col, "")).strip()
             if raw and raw.lower() != "nan":
-                # strip out any non-digit/X characters (handles Excel-style ="..." cells)
                 cleaned = re.sub(r"[^0-9Xx]", "", raw)
                 if cleaned:
                     isbn = cleaned
                     break
 
-        # Book-level genre lookups disabled — skipping Google Books / Open Library.
-        # Only nationality shelves (Wikidata P27) are applied.
-
-        # 4. Wikidata author nationality → shelf
+        # Wikidata author nationality → shelf
         nat_shelves = get_author_nationality_shelves(author)
         if nat_shelves:
             print(f"  ✓ Wikidata nationality: {nat_shelves}")
         else:
             print(f"  – Wikidata: no nationality found")
-        shelves.update(nat_shelves)
 
-        # 5. Clean: lowercase, hyphenated, no empty strings
-        shelves = {
+        merged = set(filtered)
+        merged.update(nat_shelves)
+
+        # Normalize: lowercase, hyphenate internal spaces, drop empties
+        normalized = {
             re.sub(r"\s+", "-", s.strip().lower())
-            for s in shelves if s and s.lower() != "nan"
+            for s in merged if s and s.lower() != "nan"
         }
 
-        shelf_str = ", ".join(sorted(shelves))
-        new_shelves.append(shelf_str)
-        log.append({"title": title, "author": author, "shelves": shelf_str})
+        # Bookshelves should be space-separated per user's preference
+        bookshelves_str = " ".join(sorted(normalized))
+        new_shelves.append(bookshelves_str)
+        log.append({"title": title, "author": author, "shelves": bookshelves_str})
 
         time.sleep(0.4)  # polite rate limiting
 
     df = df.copy()
     df["Bookshelves"] = new_shelves
+    # Shelves column should mirror the Exclusive Shelf column
+    if "Exclusive Shelf" in df.columns:
+        df["Shelves"] = df["Exclusive Shelf"]
+    else:
+        df["Shelves"] = ""
+
+    # Reorder columns: core set first, then preserve any other original columns
+    core_cols = [
+        "Title", "Author", "ISBN", "My Rating", "Average Rating", "Publisher",
+        "Binding", "Year Published", "Original Publication Year", "Date Read",
+        "Date Added", "Shelves", "Bookshelves", "My Review"
+    ]
+    orig_cols = list(df.columns)
+    other_cols = [c for c in orig_cols if c not in core_cols]
+    final_cols = [c for c in core_cols if c in df.columns] + other_cols
+    df = df.reindex(columns=final_cols)
     return df, log
 
 
@@ -564,7 +595,7 @@ def main():
     print(f"\n✅ Done! Saved to: {OUTPUT_FILE}")
 
     # Summary
-    total_shelves = sum(len(r["shelves"].split(", ")) for r in log if r["shelves"])
+    total_shelves = sum(len(r["shelves"].split()) for r in log if r["shelves"])
     print(f"\n📊 Summary:")
     print(f"   Books processed : {len(log)}")
     print(f"   Total shelves   : {total_shelves}")
